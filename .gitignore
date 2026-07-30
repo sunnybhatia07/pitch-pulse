@@ -1,0 +1,23 @@
+# Python / Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+venv/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Docker volumes & local data
+pg_data/
+qdrant_data/
+*.db
+*.sqlite3
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store

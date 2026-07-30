@@ -1,0 +1,6 @@
+psycopg2-binary>=2.9.9
+confluent-kafka>=2.3.0
+qdrant-client>=1.7.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+pydantic>=2.5.0
