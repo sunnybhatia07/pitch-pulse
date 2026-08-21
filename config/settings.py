@@ -25,4 +25,10 @@ class Config:
     # App
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+    # API-Football
+    API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
+    API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io")
+    API_FOOTBALL_DAILY_LIMIT = int(os.getenv("API_FOOTBALL_DAILY_LIMIT", 100))
+    API_FOOTBALL_POLL_INTERVAL_SECONDS = int(os.getenv("API_FOOTBALL_POLL_INTERVAL_SECONDS", 70))
+
 settings = Config()
