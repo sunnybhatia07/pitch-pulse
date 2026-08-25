@@ -114,3 +114,18 @@ class ApiFootballClient:
         """
         payload = self._get("/fixtures/events", params={"fixture": fixture_id})
         return payload.get("response", [])
+
+    def get_fixture_status(self, fixture_id: int) -> str | None:
+        """
+        Returns just the current status short code (e.g. "1H", "HT", "FT")
+        for a fixture, WITHOUT fetching its events. Costs 1 request.
+
+        Used by the poll loop to detect breaks (halftime, suspensions)
+        and back off from calling get_fixture_events() unnecessarily,
+        and to detect match end.
+        """
+        payload = self._get("/fixtures", params={"id": fixture_id})
+        response = payload.get("response", [])
+        if not response:
+            return None
+        return response[0].get("fixture", {}).get("status", {}).get("short")

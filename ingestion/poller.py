@@ -16,13 +16,21 @@ import time
 from ingestion.api_client import ApiFootballClient, QuotaExceededError
 from ingestion.event_buffer import EventBuffer
 from ingestion.db_writer import save_event
+from ingestion import match_status
 from utils.logger import get_logger
 from config.settings import settings
 
 logger = get_logger(__name__, settings.LOG_LEVEL)
 
-# Fixture statuses that mean "match is over, stop polling"
-FINISHED_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+# During ACTIVE play, spend 1 extra request on a status check every
+# this-many event polls, so we notice a transition to HT/FT reasonably
+# quickly without checking status on every single cycle.
+STATUS_CHECK_EVERY_N_POLLS = 5
+
+# While PAUSED (halftime, suspension, etc.), how long to wait between
+# cheap status-only checks. Deliberately much longer than the normal
+# poll interval, since nothing new can happen during a pause.
+PAUSE_RECHECK_INTERVAL_SECONDS = 180
 
 
 def select_match(client: ApiFootballClient) -> dict | None:
@@ -56,45 +64,88 @@ def select_match(client: ApiFootballClient) -> dict | None:
     fixture_id = chosen["fixture"]["id"]
     home = chosen["teams"]["home"]["name"]
     away = chosen["teams"]["away"]["name"]
-    logger.info(f"Selected fixture {fixture_id}: {home} vs {away}")
+    status = chosen["fixture"]["status"]["short"]
+    logger.info(f"Selected fixture {fixture_id}: {home} vs {away} (status={status})")
     return chosen
 
 
-def run_poll_loop(client: ApiFootballClient, buffer: EventBuffer, fixture_id: int) -> None:
+def _handle_paused(client: ApiFootballClient, fixture_id: int) -> str | None:
+    """
+    Called once per cycle while the match is PAUSED (HT, BT, SUSP, INT).
+
+    Does NOT call get_fixture_events() -- nothing new can happen during
+    a break, so polling events here would just re-fetch identical data
+    and waste quota. Instead sleeps a long interval and checks status,
+    returning the fresh status so the caller can decide what to do next.
+    """
+    logger.info(
+        f"Match paused -- skipping event poll, "
+        f"rechecking status in {PAUSE_RECHECK_INTERVAL_SECONDS}s"
+    )
+    time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
+    return client.get_fixture_status(fixture_id)
+
+
+def run_poll_loop(
+    client: ApiFootballClient,
+    buffer: EventBuffer,
+    fixture_id: int,
+    initial_status: str,
+) -> None:
     """
     Runs the poll loop for a single fixture until it ends, the quota
     is exhausted, or the process is interrupted.
+
+    State machine:
+      ACTIVE   -> poll events at normal cadence; every Nth cycle, also
+                  spend one request confirming status hasn't changed
+      PAUSED   -> stop polling events; check status on a long interval
+                  until play resumes
+      FINISHED -> stop the loop
+
+    initial_status comes from select_match()'s already-fetched fixture
+    data, so we don't waste a request re-checking status we already know.
     """
     interval = settings.API_FOOTBALL_POLL_INTERVAL_SECONDS
+    poll_count = 0
+    status = initial_status
 
     while True:
         try:
-            events = client.get_fixture_events(fixture_id)
+            if match_status.is_paused(status):
+                status = _handle_paused(client, fixture_id)
+
+            else:
+                events = client.get_fixture_events(fixture_id)
+                new_events = buffer.filter_new(events)
+                logger.info(
+                    f"Poll complete: {len(events)} total events returned, "
+                    f"{len(new_events)} new"
+                )
+                for event in new_events:
+                    save_event(fixture_id, event)
+
+                poll_count += 1
+                # Piggyback a status check every Nth cycle so we notice
+                # HT/FT reasonably quickly without checking every poll.
+                if poll_count % STATUS_CHECK_EVERY_N_POLLS == 0:
+                    status = client.get_fixture_status(fixture_id)
+
+                if client.last_rate_limit and client.last_rate_limit.is_low:
+                    logger.warning(
+                        f"Quota running low: {client.last_rate_limit.remaining_day} "
+                        f"requests remaining today."
+                    )
+
+                time.sleep(interval)
+
         except QuotaExceededError as e:
             logger.warning(f"Stopping poll loop: {e}")
             break
 
-        new_events = buffer.filter_new(events)
-        logger.info(
-            f"Poll complete: {len(events)} total events returned, "
-            f"{len(new_events)} new"
-        )
-        for event in new_events:
-            save_event(fixture_id, event)
-
-        # Check match status by re-fetching live fixtures list would cost
-        # another request, so instead we check the status embedded in the
-        # events response's parent fixture data when available. Simplest
-        # reliable approach for now: rely on QuotaExceededError or manual
-        # stop; a cleaner status check is a good next refinement.
-
-        if client.last_rate_limit and client.last_rate_limit.is_low:
-            logger.warning(
-                f"Quota running low: {client.last_rate_limit.remaining_day} "
-                f"requests remaining today."
-            )
-
-        time.sleep(interval)
+        if match_status.is_finished(status):
+            logger.info(f"Match status is '{status}' -- match over, stopping poll loop.")
+            break
 
 
 def main():
@@ -107,9 +158,10 @@ def main():
         return
 
     fixture_id = match["fixture"]["id"]
+    initial_status = match["fixture"]["status"]["short"]
 
     try:
-        run_poll_loop(client, buffer, fixture_id)
+        run_poll_loop(client, buffer, fixture_id, initial_status)
     except KeyboardInterrupt:
         logger.info(f"Interrupted by user. Total events captured: {len(buffer)}")
 
