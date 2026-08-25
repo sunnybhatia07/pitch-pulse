@@ -105,27 +105,32 @@ class ApiFootballClient:
         payload = self._get("/fixtures", params={"live": "all"})
         return payload.get("response", [])
 
-    def get_fixture_events(self, fixture_id: int) -> list[dict]:
+    def get_fixture_snapshot(self, fixture_id: int) -> dict | None:
         """
-        Returns the FULL list of events for a given fixture so far
-        (not a delta since last call — API-Football always returns
-        everything that's happened in the match up to now).
-        Costs 1 request per call.
-        """
-        payload = self._get("/fixtures/events", params={"fixture": fixture_id})
-        return payload.get("response", [])
+        Returns the full fixture snapshot for a live match in ONE request:
+        status, events, statistics, lineups, and players all embedded in
+        a single response from /fixtures?id={fixture_id}.
 
-    def get_fixture_status(self, fixture_id: int) -> str | None:
-        """
-        Returns just the current status short code (e.g. "1H", "HT", "FT")
-        for a fixture, WITHOUT fetching its events. Costs 1 request.
+        This replaces what used to be two separate calls (get_fixture_events
+        + get_fixture_status) -- API-Football embeds all four related
+        objects on this endpoint already, so calling them separately was
+        paying for the same data twice. Updates every ~15s for live matches,
+        same freshness as the dedicated /fixtures/events endpoint.
 
-        Used by the poll loop to detect breaks (halftime, suspensions)
-        and back off from calling get_fixture_events() unnecessarily,
-        and to detect match end.
+        Returns None if the fixture isn't found (e.g. bad ID).
+
+        Shape of the returned dict (subset of what's used so far):
+          {
+            "fixture": {..., "status": {"short": "1H", ...}, ...},
+            "teams": {...},
+            "events": [...],       # same shape as before
+            "statistics": [...],   # team-level aggregates (possession, shots, passes)
+            "lineups": [...],      # formation + starting XI, static once set
+            "players": [...],      # per-player match stats
+          }
         """
         payload = self._get("/fixtures", params={"id": fixture_id})
         response = payload.get("response", [])
         if not response:
             return None
-        return response[0].get("fixture", {}).get("status", {}).get("short")
+        return response[0]

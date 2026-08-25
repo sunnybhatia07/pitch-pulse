@@ -4,11 +4,14 @@ together into a running poll loop for ONE live match.
 
 Sequence:
   1. Ask the API for currently live fixtures, pick one to track
-  2. Every POLL_INTERVAL seconds:
-       - fetch the full event list for that fixture
-       - filter to only new events via EventBuffer
+  2. Every POLL_INTERVAL seconds while the match is active:
+       - pull one combined snapshot (status + events + statistics +
+         players) from /fixtures?id={id}
+       - filter events to only new ones via EventBuffer
        - hand each new event to save_event() (stub for now)
-  3. Stop when the match ends, the quota runs out, or on Ctrl+C
+  3. While paused (e.g. halftime), skip snapshots and just check
+     status on a long interval until play resumes
+  4. Stop when the match ends, the quota runs out, or on Ctrl+C
 """
 
 import time
@@ -22,14 +25,10 @@ from config.settings import settings
 
 logger = get_logger(__name__, settings.LOG_LEVEL)
 
-# During ACTIVE play, spend 1 extra request on a status check every
-# this-many event polls, so we notice a transition to HT/FT reasonably
-# quickly without checking status on every single cycle.
-STATUS_CHECK_EVERY_N_POLLS = 5
-
 # While PAUSED (halftime, suspension, etc.), how long to wait between
-# cheap status-only checks. Deliberately much longer than the normal
-# poll interval, since nothing new can happen during a pause.
+# snapshot checks. Deliberately much longer than the normal poll
+# interval, since nothing new can happen during a pause -- we're only
+# checking to see whether status has changed yet.
 PAUSE_RECHECK_INTERVAL_SECONDS = 180
 
 
@@ -69,21 +68,60 @@ def select_match(client: ApiFootballClient) -> dict | None:
     return chosen
 
 
+# Stat types worth watching poll-to-poll for tactical signal. API-Football
+# returns many more than this per team (Fouls, Offsides, Corners, etc.) --
+# keeping this list short so the log stays readable; add to it as Phase 5
+# metric needs become clearer.
+TRACKED_STAT_TYPES = {"Ball Possession", "Total Shots", "Shots on Goal", "Passes %"}
+
+
+def _summarize_statistics(statistics: list[dict]) -> str:
+    """
+    Formats the raw statistics payload (list of one dict per team, each
+    holding its own list of {"type": ..., "value": ...} pairs) into a
+    single readable log line, e.g.:
+
+      "Abha: Ball Possession=48%, Total Shots=9 | Al Khaleej Saihat: ..."
+
+    This is display-only -- it doesn't change what's stored anywhere,
+    just makes it possible to visually confirm values are actually
+    changing poll-to-poll rather than only seeing a static entry count.
+    """
+    if not statistics:
+        return "(no statistics available)"
+
+    team_summaries = []
+    for team_block in statistics:
+        team_name = team_block.get("team", {}).get("name", "Unknown")
+        stat_list = team_block.get("statistics", []) or []
+        values = {
+            s.get("type"): s.get("value")
+            for s in stat_list
+            if s.get("type") in TRACKED_STAT_TYPES
+        }
+        formatted = ", ".join(f"{k}={v}" for k, v in values.items())
+        team_summaries.append(f"{team_name}: {formatted}")
+
+    return " | ".join(team_summaries)
+
+
 def _handle_paused(client: ApiFootballClient, fixture_id: int) -> str | None:
     """
     Called once per cycle while the match is PAUSED (HT, BT, SUSP, INT).
 
-    Does NOT call get_fixture_events() -- nothing new can happen during
-    a break, so polling events here would just re-fetch identical data
-    and waste quota. Instead sleeps a long interval and checks status,
-    returning the fresh status so the caller can decide what to do next.
+    Sleeps a long interval, then pulls a snapshot purely to read its
+    status back out -- the events/statistics/players in that response
+    are ignored here since nothing new can happen during a break.
     """
     logger.info(
-        f"Match paused -- skipping event poll, "
-        f"rechecking status in {PAUSE_RECHECK_INTERVAL_SECONDS}s"
+        f"Match paused -- waiting {PAUSE_RECHECK_INTERVAL_SECONDS}s "
+        f"before rechecking status"
     )
     time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
-    return client.get_fixture_status(fixture_id)
+    snapshot = client.get_fixture_snapshot(fixture_id)
+    if snapshot is None:
+        return None
+    return snapshot.get("fixture", {}).get("status", {}).get("short")
 
 
 def run_poll_loop(
@@ -97,17 +135,16 @@ def run_poll_loop(
     is exhausted, or the process is interrupted.
 
     State machine:
-      ACTIVE   -> poll events at normal cadence; every Nth cycle, also
-                  spend one request confirming status hasn't changed
-      PAUSED   -> stop polling events; check status on a long interval
-                  until play resumes
+      ACTIVE   -> pull a full snapshot (status + events + statistics +
+                  players, one request) every poll interval
+      PAUSED   -> skip the normal cadence; check a snapshot on a long
+                  interval until play resumes
       FINISHED -> stop the loop
 
     initial_status comes from select_match()'s already-fetched fixture
     data, so we don't waste a request re-checking status we already know.
     """
     interval = settings.API_FOOTBALL_POLL_INTERVAL_SECONDS
-    poll_count = 0
     status = initial_status
 
     while True:
@@ -116,20 +153,29 @@ def run_poll_loop(
                 status = _handle_paused(client, fixture_id)
 
             else:
-                events = client.get_fixture_events(fixture_id)
+                snapshot = client.get_fixture_snapshot(fixture_id)
+                if snapshot is None:
+                    logger.warning("Snapshot returned no data, will retry next cycle.")
+                    time.sleep(interval)
+                    continue
+
+                status = snapshot.get("fixture", {}).get("status", {}).get("short")
+                events = snapshot.get("events", []) or []
+                statistics = snapshot.get("statistics", []) or []
+                players = snapshot.get("players", []) or []
+
                 new_events = buffer.filter_new(events)
                 logger.info(
                     f"Poll complete: {len(events)} total events returned, "
-                    f"{len(new_events)} new"
+                    f"{len(new_events)} new | players entries: {len(players)}"
                 )
+                logger.info(f"Statistics -> {_summarize_statistics(statistics)}")
                 for event in new_events:
                     save_event(fixture_id, event)
 
-                poll_count += 1
-                # Piggyback a status check every Nth cycle so we notice
-                # HT/FT reasonably quickly without checking every poll.
-                if poll_count % STATUS_CHECK_EVERY_N_POLLS == 0:
-                    status = client.get_fixture_status(fixture_id)
+                # statistics/players aren't persisted yet -- no schema
+                # for them until Phase 3. Logged now purely so we can
+                # see their real shape while designing that schema.
 
                 if client.last_rate_limit and client.last_rate_limit.is_low:
                     logger.warning(
