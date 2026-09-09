@@ -68,60 +68,142 @@ def select_match(client: ApiFootballClient) -> dict | None:
     return chosen
 
 
-# Stat types worth watching poll-to-poll for tactical signal. API-Football
-# returns many more than this per team (Fouls, Offsides, Corners, etc.) --
-# keeping this list short so the log stays readable; add to it as Phase 5
-# metric needs become clearer.
-TRACKED_STAT_TYPES = {"Ball Possession", "Total Shots", "Shots on Goal", "Passes %"}
-
-
-def _summarize_statistics(statistics: list[dict]) -> str:
+def _summarize_statistics(statistics: list[dict], elapsed: int | None = None) -> str:
     """
     Formats the raw statistics payload (list of one dict per team, each
     holding its own list of {"type": ..., "value": ...} pairs) into a
-    single readable log line, e.g.:
+    single readable log line -- ALL stat types returned by the API,
+    not a curated subset, so nothing is lost before Phase 3 decides
+    what to keep.
 
-      "Abha: Ball Possession=48%, Total Shots=9 | Al Khaleej Saihat: ..."
-
-    This is display-only -- it doesn't change what's stored anywhere,
-    just makes it possible to visually confirm values are actually
-    changing poll-to-poll rather than only seeing a static entry count.
+    Statistics themselves carry no minute field (they're whole-match
+    running totals, not timestamped like events), so the current match
+    clock is passed in separately from the fixture's status.elapsed --
+    same idea as the min= shown on each player line, just sourced from
+    the fixture rather than from the stat itself.
     """
     if not statistics:
         return "(no statistics available)"
+
+    prefix = f"minute={elapsed} | " if elapsed is not None else ""
 
     team_summaries = []
     for team_block in statistics:
         team_name = team_block.get("team", {}).get("name", "Unknown")
         stat_list = team_block.get("statistics", []) or []
-        values = {
-            s.get("type"): s.get("value")
-            for s in stat_list
-            if s.get("type") in TRACKED_STAT_TYPES
-        }
+        values = {s.get("type"): s.get("value") for s in stat_list}
         formatted = ", ".join(f"{k}={v}" for k, v in values.items())
         team_summaries.append(f"{team_name}: {formatted}")
 
-    return " | ".join(team_summaries)
+    return prefix + " | ".join(team_summaries)
 
 
-def _handle_paused(client: ApiFootballClient, fixture_id: int) -> str | None:
+def _summarize_players(players: list[dict]) -> str:
+    """
+    Formats the raw players payload into one readable log line PER
+    PLAYER -- ALL statistic categories the API returns, including the
+    ones outfield-only formatting used to miss (goalkeeper saves live
+    under goals.saves, not under shots/dribbles/tackles), plus
+    offsides and penalty stats.
+
+    Players who haven't recorded any minutes yet are still skipped --
+    an unused substitute's stats are all null/zero and add nothing
+    but noise. Everyone who's actually been on the pitch, including
+    the goalkeeper, gets every field the API provides for them.
+    """
+    if not players:
+        return "(no player data available)"
+
+    lines = []
+    for team_block in players:
+        team_name = team_block.get("team", {}).get("name", "Unknown")
+        for entry in team_block.get("players", []) or []:
+            info = entry.get("player", {}) or {}
+            name = info.get("name", "Unknown")
+
+            stats_list = entry.get("statistics", []) or []
+            if not stats_list:
+                continue
+            stats = stats_list[0]
+
+            games = stats.get("games", {}) or {}
+            minutes = games.get("minutes")
+            if not minutes:
+                continue  # hasn't played yet -- skip the noise
+
+            position = games.get("position")
+            rating = games.get("rating")
+            captain = games.get("captain")
+            offsides = stats.get("offsides")
+            shots = stats.get("shots", {}) or {}
+            goals = stats.get("goals", {}) or {}
+            passes = stats.get("passes", {}) or {}
+            tackles = stats.get("tackles", {}) or {}
+            duels = stats.get("duels", {}) or {}
+            dribbles = stats.get("dribbles", {}) or {}
+            fouls = stats.get("fouls", {}) or {}
+            cards = stats.get("cards", {}) or {}
+            penalty = stats.get("penalty", {}) or {}
+
+            lines.append(
+                f"  [{team_name}] {name} ({position}{' C' if captain else ''}) "
+                f"min={minutes} rating={rating} offsides={offsides} | "
+                f"shots={shots.get('total')}/on={shots.get('on')} "
+                f"goals={goals.get('total')} assists={goals.get('assists')} "
+                f"conceded={goals.get('conceded')} saves={goals.get('saves')} | "
+                f"passes={passes.get('total')} key={passes.get('key')} acc={passes.get('accuracy')} | "
+                f"tackles={tackles.get('total')} blocks={tackles.get('blocks')} "
+                f"interceptions={tackles.get('interceptions')} "
+                f"duels_won={duels.get('won')}/{duels.get('total')} "
+                f"dribbles={dribbles.get('success')}/{dribbles.get('attempts')} past={dribbles.get('past')} | "
+                f"fouls_drawn={fouls.get('drawn')} fouls_committed={fouls.get('committed')} "
+                f"cards=Y{cards.get('yellow')}/R{cards.get('red')} | "
+                f"pen_won={penalty.get('won')} pen_committed={penalty.get('commited')} "
+                f"pen_scored={penalty.get('scored')} pen_missed={penalty.get('missed')} pen_saved={penalty.get('saved')}"
+            )
+
+    return "\n".join(lines) if lines else "(no players with recorded minutes yet)"
+
+
+def _handle_paused(client: ApiFootballClient, buffer: EventBuffer, fixture_id: int) -> str | None:
     """
     Called once per cycle while the match is PAUSED (HT, BT, SUSP, INT).
 
-    Sleeps a long interval, then pulls a snapshot purely to read its
-    status back out -- the events/statistics/players in that response
-    are ignored here since nothing new can happen during a break.
+    Still pulls the FULL snapshot (events, statistics, players), not
+    just status -- the combined endpoint returns all of it for the
+    same 1-request cost regardless of what we read out of it, so
+    discarding events/statistics/players here just to check status
+    was throwing away data for free. This closes the gap where no
+    data got logged during a pause window.
+
+    Any genuinely new event that lands right at the pause boundary
+    (rare, but possible) still gets deduped and saved normally.
     """
-    logger.info(
-        f"Match paused -- waiting {PAUSE_RECHECK_INTERVAL_SECONDS}s "
-        f"before rechecking status"
-    )
-    time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
     snapshot = client.get_fixture_snapshot(fixture_id)
     if snapshot is None:
+        logger.warning("Snapshot returned no data while paused, will retry.")
+        time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
         return None
-    return snapshot.get("fixture", {}).get("status", {}).get("short")
+
+    status = snapshot.get("fixture", {}).get("status", {}).get("short")
+    elapsed = snapshot.get("fixture", {}).get("status", {}).get("elapsed")
+    events = snapshot.get("events", []) or []
+    statistics = snapshot.get("statistics", []) or []
+    players = snapshot.get("players", []) or []
+
+    new_events = buffer.filter_new(events)
+    logger.info(
+        f"[PAUSED check] status={status} | {len(events)} total events, "
+        f"{len(new_events)} new"
+    )
+    logger.info(f"Statistics -> {_summarize_statistics(statistics, elapsed)}")
+    logger.info(f"Players ->\n{_summarize_players(players)}")
+    for event in new_events:
+        save_event(fixture_id, event)
+
+    logger.info(f"Rechecking again in {PAUSE_RECHECK_INTERVAL_SECONDS}s")
+    time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
+    return status
 
 
 def run_poll_loop(
@@ -150,7 +232,7 @@ def run_poll_loop(
     while True:
         try:
             if match_status.is_paused(status):
-                status = _handle_paused(client, fixture_id)
+                status = _handle_paused(client, buffer, fixture_id)
 
             else:
                 snapshot = client.get_fixture_snapshot(fixture_id)
@@ -160,6 +242,7 @@ def run_poll_loop(
                     continue
 
                 status = snapshot.get("fixture", {}).get("status", {}).get("short")
+                elapsed = snapshot.get("fixture", {}).get("status", {}).get("elapsed")
                 events = snapshot.get("events", []) or []
                 statistics = snapshot.get("statistics", []) or []
                 players = snapshot.get("players", []) or []
@@ -167,9 +250,10 @@ def run_poll_loop(
                 new_events = buffer.filter_new(events)
                 logger.info(
                     f"Poll complete: {len(events)} total events returned, "
-                    f"{len(new_events)} new | players entries: {len(players)}"
+                    f"{len(new_events)} new"
                 )
-                logger.info(f"Statistics -> {_summarize_statistics(statistics)}")
+                logger.info(f"Statistics -> {_summarize_statistics(statistics, elapsed)}")
+                logger.info(f"Players ->\n{_summarize_players(players)}")
                 for event in new_events:
                     save_event(fixture_id, event)
 

@@ -6,9 +6,10 @@ Does NOT loop. Costs at most 2 requests:
   2. GET /fixtures?id={id}    -- combined snapshot: events, statistics,
                                   lineups, and players all in one response
 
-Reuses select_match() from ingestion.poller so match selection behaves
-identically here and in the real poll loop -- one place to maintain,
-not two copies of the same "list and pick" logic.
+Reuses select_match() AND the statistics/player summarizers from
+ingestion.poller, so this script's output is formatted identically to
+what you'd see in a real poll loop run -- one place to maintain the
+formatting logic, not two copies of it.
 
 Run this any time you want to eyeball raw payload shapes for a specific
 match without starting a full poll loop.
@@ -17,7 +18,7 @@ match without starting a full poll loop.
 import json
 
 from ingestion.api_client import ApiFootballClient, QuotaExceededError
-from ingestion.poller import select_match
+from ingestion.poller import select_match, _summarize_statistics, _summarize_players
 
 client = ApiFootballClient()
 
@@ -46,29 +47,24 @@ if snapshot is None:
     raise SystemExit(0)
 
 status = snapshot.get("fixture", {}).get("status", {}).get("short")
+elapsed = snapshot.get("fixture", {}).get("status", {}).get("elapsed")
 events = snapshot.get("events", []) or []
 statistics = snapshot.get("statistics", []) or []
 lineups = snapshot.get("lineups", []) or []
 players = snapshot.get("players", []) or []
 
-print(f"\nStatus: {status}")
+print(f"\nStatus: {status} | Minute: {elapsed}")
 print(f"Events: {len(events)} | Statistics entries: {len(statistics)} | "
       f"Lineups: {len(lineups)} | Players entries: {len(players)}")
+
+print("\n--- Statistics (full, all stat types) ---")
+print(_summarize_statistics(statistics, elapsed))
+
+print("\n--- Players (full per-player breakdown) ---")
+print(_summarize_players(players))
 
 print("\n--- Raw event payload (first event, if any) ---")
 if events:
     print(json.dumps(events[0], indent=2))
 else:
     print("No events yet in this match (early in the game, or a slow one).")
-
-print("\n--- Raw statistics payload (first team, if any) ---")
-if statistics:
-    print(json.dumps(statistics[0], indent=2))
-else:
-    print("No statistics available yet for this match/competition.")
-
-print("\n--- Raw players payload (first team, first player, if any) ---")
-if players and players[0].get("players"):
-    print(json.dumps(players[0]["players"][0], indent=2))
-else:
-    print("No player statistics available yet for this match/competition.")
