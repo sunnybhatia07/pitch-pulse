@@ -18,7 +18,7 @@ import time
 
 from ingestion.api_client import ApiFootballClient, QuotaExceededError
 from ingestion.event_buffer import EventBuffer
-from ingestion.db_writer import save_event
+from ingestion.db_writer import save_poll
 from ingestion import match_status
 from utils.logger import get_logger
 from config.settings import settings
@@ -198,8 +198,7 @@ def _handle_paused(client: ApiFootballClient, buffer: EventBuffer, fixture_id: i
     )
     logger.info(f"Statistics -> {_summarize_statistics(statistics, elapsed)}")
     logger.info(f"Players ->\n{_summarize_players(players)}")
-    for event in new_events:
-        save_event(fixture_id, event)
+    save_poll(fixture_id, snapshot, new_events)
 
     logger.info(f"Rechecking again in {PAUSE_RECHECK_INTERVAL_SECONDS}s")
     time.sleep(PAUSE_RECHECK_INTERVAL_SECONDS)
@@ -254,8 +253,9 @@ def run_poll_loop(
                 )
                 logger.info(f"Statistics -> {_summarize_statistics(statistics, elapsed)}")
                 logger.info(f"Players ->\n{_summarize_players(players)}")
-                for event in new_events:
-                    save_event(fixture_id, event)
+
+                save_poll(fixture_id, snapshot, new_events)
+
 
                 # statistics/players aren't persisted yet -- no schema
                 # for them until Phase 3. Logged now purely so we can
